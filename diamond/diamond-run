@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""diamond-run: run a command inside a deny-by-default Landlock sandbox."""
+import argparse, ctypes, os, sys
+from ctypes import c_uint64, c_int32, c_size_t, byref
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+SYS_CREATE, SYS_ADD, SYS_RESTRICT = 444, 445, 446
+
+EXEC, WRITE_FILE, READ_FILE, READ_DIR = 1 << 0, 1 << 1, 1 << 2, 1 << 3
+REMOVE_DIR, REMOVE_FILE = 1 << 4, 1 << 5
+MAKE = sum(1 << i for i in range(6, 13))
+REFER, TRUNCATE = 1 << 13, 1 << 14
+FILE_OK = EXEC | WRITE_FILE | READ_FILE | TRUNCATE
+RO = READ_FILE | READ_DIR | EXEC
+RW = RO | WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE | REFER | TRUNCATE
+CONNECT_TCP = 1 << 1
+
+class RulesetAttr(ctypes.Structure):
+    _fields_ = [("fs", c_uint64), ("net", c_uint64), ("scoped", c_uint64)]
+
+class PathBeneath(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [("access", c_uint64), ("parent_fd", c_int32)]
+
+class NetPort(ctypes.Structure):
+    _fields_ = [("access", c_uint64), ("port", c_uint64)]
+
+def check(ret, what):
+    if ret < 0:
+        sys.exit(f"[diamond] {what} failed: {os.strerror(ctypes.get_errno())}")
+    return ret
+
+def idmap(iu, ou, ig, og):
+    for f, v in (("setgroups", "deny"), ("gid_map", f"{ig} {og} 1"), ("uid_map", f"{iu} {ou} 1")):
+        with open(f"/proc/self/{f}", "w") as fh: fh.write(v)
+
+def overlay(ws, st):
+    """Mount a copy-on-write overlay over the workspace. Agent writes land in st/upper; the real folder is untouched."""
+    uid, gid = os.getuid(), os.getgid()
+    check(libc.unshare(0x10020000), "unshare user+mount namespace")  # CLONE_NEWUSER|CLONE_NEWNS
+    idmap(0, uid, 0, gid)
+    libc.mount(None, b"/", None, 0x44000, None)  # MS_REC|MS_PRIVATE
+    opts = f"lowerdir={ws},upperdir={st}/upper,workdir={st}/work,userxattr".encode()
+    check(libc.mount(b"overlay", ws.encode(), b"overlay", 0, opts), "mount overlay")
+    check(libc.unshare(0x10000000), "unshare nested user namespace")  # drop back to your own uid (agents refuse to run as root)
+    idmap(uid, 0, gid, 0)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workspace", required=True, help="the only writable project dir")
+    ap.add_argument("--ro", action="append", default=[], help="extra read-only path")
+    ap.add_argument("--rw", action="append", default=[], help="extra read-write path")
+    ap.add_argument("--net", choices=["deny", "allow"], default="deny")
+    ap.add_argument("--connect-port", type=int, action="append", default=[])
+    ap.add_argument("--overlay", help="state dir; writes go to a copy-on-write layer there")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if not cmd:
+        sys.exit("usage: diamond-run --workspace DIR [opts] -- command ...")
+
+    if a.overlay: overlay(os.path.realpath(a.workspace), os.path.realpath(a.overlay))
+    abi = libc.syscall(SYS_CREATE, None, 0, 1)
+    check(abi, "landlock not available")
+    handled = 0x1FFF | (REFER if abi >= 2 else 0) | (TRUNCATE if abi >= 3 else 0)
+    net = CONNECT_TCP if (abi >= 4 and a.net == "deny") else 0
+    scoped = 3 if abi >= 6 else 0
+    size = 8 if abi < 4 else 16 if abi < 6 else 24
+    attr = RulesetAttr(handled, net, scoped)
+    fd = check(libc.syscall(SYS_CREATE, byref(attr), c_size_t(size), 0), "create ruleset")
+
+    def allow(path, access):
+        path = os.path.realpath(os.path.expanduser(path))
+        try:
+            pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        except OSError:
+            return
+        access &= handled
+        if not os.path.isdir(path):
+            access &= FILE_OK
+        rule = PathBeneath(access, pfd)
+        check(libc.syscall(SYS_ADD, fd, 1, byref(rule), 0), f"add rule {path}")
+        os.close(pfd)
+
+    for p in ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/proc", "/mnt/wsl"]:
+        allow(p, RO)
+    allow("/dev", READ_FILE | READ_DIR | WRITE_FILE)
+    allow("/tmp", RW)
+    allow(a.workspace, RW)
+    for p in a.ro: allow(p, RO)
+    for p in a.rw: allow(p, RW)
+    for port in a.connect_port:
+        r = NetPort(CONNECT_TCP, port)
+        check(libc.syscall(SYS_ADD, fd, 2, byref(r), 0), f"allow port {port}")
+
+    check(libc.prctl(38, 1, 0, 0, 0), "no_new_privs")
+    check(libc.syscall(SYS_RESTRICT, fd, 0), "restrict self")
+    os.chdir(os.path.realpath(a.workspace))
+    print(f"[diamond] sandbox on (Landlock ABI {abi}) workspace={a.workspace} "
+          f"net={'allow' if a.net == 'allow' else 'deny+ports' + str(a.connect_port)}", file=sys.stderr)
+    os.execvp(cmd[0], cmd)
+
+main()
