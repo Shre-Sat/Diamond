@@ -1,0 +1,28 @@
+{
+ "nodes": [
+  {
+   "id": "n1",
+   "name": "dev-laptop (simulated)",
+   "mode": "demo",
+   "online": true,
+   "cpu": 23,
+   "memMb": 4100,
+   "agents": 1,
+   "sessions": 1
+  },
+  {
+   "id": "n2",
+   "name": "ci-runner (simulated)",
+   "mode": "demo",
+   "online": false,
+   "cpu": 0,
+   "memMb": 0,
+   "agents": 0,
+   "sessions": 0
+  }
+ ],
+ "capacity": {
+  "used": 1,
+  "total": 4
+ }
+}
